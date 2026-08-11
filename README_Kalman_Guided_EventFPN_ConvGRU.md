@@ -1,81 +1,102 @@
-# Kalman-Guided EventFPN–ConvGRU Pedestrian Detection
+# Uncertainty-Aware Event Memory for EventFPN-ConvGRU Pedestrian Detection
 
 ## 1. Overview
 
-This project extends an event-based pedestrian detector built with:
+This project explores a temporally aware event-based pedestrian detector built with:
 
 - **DAVIS346 event-camera data**
 - **PEDRo dataset**
 - **EventFPN**
 - **ConvGRU**
-- A pedestrian detection head
+- a pedestrian detection head
 
-The proposed extension introduces a **linear Kalman filter (KF)** before each current inference step.
+The proposed extension is an **uncertainty-aware event memory** that generates soft spatial priors for the detector.
 
-The KF is not used only as a conventional post-processing tracker. Instead, it maintains lightweight pedestrian states and predicts where previously detected pedestrians are likely to appear in the next event window. These predictions are converted into soft spatial prior maps and provided to the EventFPN–ConvGRU detector.
+The memory is not a conventional post-processing tracker. Instead of only smoothing detections after inference, it maintains a persistent belief about where pedestrian evidence may continue to exist, how reliable that belief is, and how uncertain each spatial hypothesis has become over time.
 
-The overall concept is:
+The detector receives the current event representation together with memory-generated prior maps.
 
 ```text
-Previous detections
+Past event evidence + past detections
         ↓
-Kalman update
+Uncertainty-aware event memory
         ↓
-Kalman prediction for the next timestamp
-        ↓
-Soft spatial prior maps
+Spatial belief / uncertainty / age priors
         ↓
 Current event representation + prior maps
         ↓
 EventFPN + ConvGRU
         ↓
 Current pedestrian detections
+        ↓
+Memory update for the next event window
 ```
 
-The principal objective remains **pedestrian detection enhancement**, especially under sparse or intermittent event evidence.
+The principal objective is still **pedestrian detection enhancement**, especially when event evidence is sparse, intermittent, ambiguous, or temporarily absent.
 
 ---
 
-## 2. Main Objective
+## 2. Motivation
 
-The proposed KF integration is intended to improve:
+Event cameras report brightness changes rather than dense image frames. This creates detection failure modes that are different from standard RGB or frame-based pedestrian detection:
 
-- pedestrian recall;
-- temporal consistency;
-- bounding-box stability;
-- detection during low-event-density intervals;
-- detection of slowly moving or briefly stationary pedestrians;
-- robustness to temporary missed detections;
-- continuity between consecutive event windows.
+- a slowly moving pedestrian may generate weak events;
+- a temporarily stationary pedestrian may almost disappear;
+- event density may vary strongly between windows;
+- background motion may dominate the event stream;
+- short occlusion can interrupt detections;
+- detector confidence may fluctuate across adjacent windows.
 
-The KF performs internal object-state tracking, but tracking is an enabling mechanism rather than the main output.
+A detector that only sees the current event window may miss pedestrians that remain physically present but generate weak event evidence.
 
-A precise description of the approach is:
+The proposed memory addresses this by carrying forward a spatial belief from previous windows, while explicitly modeling whether that belief should be trusted.
 
-> **Kalman-guided, tracking-assisted event-based pedestrian detection.**
+In one sentence:
+
+```text
+The memory gives the event-based detector a causal, uncertainty-aware prior about where pedestrian evidence is likely to persist.
+```
 
 ---
 
-## 3. Recommended Architecture
+## 3. Core Research Idea
+
+The key change from a traditional filtering or tracking approach is that the persistent state is represented as **event-conditioned spatial memory**, not only as a list of tracked bounding boxes.
+
+The memory stores maps or object-linked map components such as:
+
+- pedestrian belief;
+- uncertainty;
+- reliability;
+- age or staleness;
+- event support;
+- optional local motion consistency.
+
+These maps are aligned with the event tensor and can be consumed directly by the detector.
+
+The method can still use detections to initialize, reinforce, or suppress memory hypotheses, but its primary output is a set of **soft spatial priors**, not track IDs.
+
+---
+
+## 4. Recommended Architecture
 
 The recommended first implementation uses:
 
-- a **fixed linear Kalman filter**;
-- fixed transition and measurement models;
-- fixed process and measurement covariance matrices;
-- soft KF-generated prior maps;
-- a retrained or fine-tuned EventFPN–ConvGRU detector;
 - full-frame event input;
-- no per-event Kalman filtering;
+- an uncertainty-aware memory bank;
+- memory-generated soft prior maps;
 - no hard spatial cropping;
-- no learned Kalman gain;
-- no fully learned KalmanNet-style module.
+- no raw-event rejection outside predicted regions;
+- a retrained or fine-tuned EventFPN-ConvGRU detector;
+- causal sequential training;
+- fixed handcrafted memory dynamics in the first stage;
+- optional learnable memory-update parameters only after a fixed baseline is validated.
 
-The KF participates in the training and deployment data flow, but its parameters are initially frozen.
+The memory should participate in both training and deployment data flow. The detector must learn how to interpret the memory channels during training.
 
 ---
 
-## 4. Complete Design Flow
+## 5. Complete Design Flow
 
 ```text
                               DAVIS346 event stream
@@ -88,17 +109,20 @@ The KF participates in the training and deployment data flow, but its parameters
              voxel grid / time surface / multi-window representation
                                        │
                                        │
-                                       │
-Previous posterior pedestrian states   │
-{x_hat_(k-1)^+, P_(k-1)^+}             │
+Previous memory state                  │
+{B_(k-1), U_(k-1), A_(k-1), S_(k-1)}   │
                   │                    │
                   ▼                    │
-       Kalman prediction to t_k        │
-       {x_hat_k^-, P_k^-}              │
+        Temporal memory propagation    │
+    decay / diffusion / motion shift   │
+                  │                    │
+                  ▼                    │
+       Event-conditioned memory update │
+ event support / silence / confidence │
                   │                    │
                   ▼                    │
          Prior-map rasterization       │
- occupancy / reliability / age maps   │
+ belief / uncertainty / age / support │
                   │                    │
                   └──────────┬─────────┘
                              ▼
@@ -118,288 +142,31 @@ Previous posterior pedestrian states   │
               Pedestrian boxes and confidence scores
                              │
                              ▼
-          Detection-to-state association and gating
+                    Detection-informed update
                              │
-                   ┌─────────┴─────────┐
-                   ▼                   ▼
-             Matched states      Unmatched detections
-                   │                   │
-                   ▼                   ▼
-            Kalman update       Initialize new states
-                   │
-                   ▼
-          Updated posterior state bank
-               {x_hat_k^+, P_k^+}
-                   │
-                   └──────────────► Used before inference at k+1
+                             ▼
+                  Updated memory for k+1
 ```
 
 ---
 
-## 5. Why a Linear KF Is Recommended
+## 6. Memory State
 
-For a 2-D bounding-box state, both the state transition and measurement functions are linear.
-
-A suitable state is:
+For each timestamped event window \(k\), maintain a memory state:
 
 \[
-\mathbf{x}_k =
-\begin{bmatrix}
-c_x &
-c_y &
-w &
-h &
-v_x &
-v_y &
-v_w &
-v_h
-\end{bmatrix}^{T}
+\mathcal{M}_k =
+\{B_k, U_k, A_k, S_k\}
 \]
 
 where:
 
-- \(c_x, c_y\): bounding-box center;
-- \(w, h\): bounding-box width and height;
-- \(v_x, v_y\): center velocity;
-- \(v_w, v_h\): width and height variation rates.
+- \(B_k \in [0,1]^{H \times W}\): pedestrian belief map;
+- \(U_k \in [0,1]^{H \times W}\): uncertainty map;
+- \(A_k \in [0,1]^{H \times W}\): age or staleness map;
+- \(S_k \in [0,1]^{H \times W}\): recent event-support map.
 
-The detector measurement is:
-
-\[
-\mathbf{z}_k =
-\begin{bmatrix}
-c_x &
-c_y &
-w &
-h
-\end{bmatrix}^{T}
-\]
-
-The process model is:
-
-\[
-\mathbf{x}_k =
-\mathbf{F}(\Delta t_k)\mathbf{x}_{k-1}
-+
-\mathbf{w}_k
-\]
-
-The measurement model is:
-
-\[
-\mathbf{z}_k =
-\mathbf{H}\mathbf{x}_k
-+
-\mathbf{v}_k
-\]
-
-Because both models are linear, an **Extended Kalman Filter is not required** for the bounding-box state.
-
-An EKF should only be considered for a genuinely nonlinear problem, such as:
-
-- camera pose estimation;
-- event–IMU fusion;
-- quaternion orientation;
-- nonlinear 3-D-to-2-D projection;
-- perspective-aware motion;
-- ego-motion compensation.
-
----
-
-## 6. State Transition Model
-
-For the state ordering
-
-\[
-[c_x,c_y,w,h,v_x,v_y,v_w,v_h]^T
-\]
-
-the transition matrix is:
-
-\[
-\mathbf{F}(\Delta t_k)
-=
-\begin{bmatrix}
-\mathbf{I}_4 & \Delta t_k\mathbf{I}_4 \\
-\mathbf{0}_4 & \mathbf{I}_4
-\end{bmatrix}
-\]
-
-The prediction equations are:
-
-\[
-\hat{\mathbf{x}}_k^{-}
-=
-\mathbf{F}(\Delta t_k)\hat{\mathbf{x}}_{k-1}^{+}
-\]
-
-\[
-\mathbf{P}_k^{-}
-=
-\mathbf{F}(\Delta t_k)
-\mathbf{P}_{k-1}^{+}
-\mathbf{F}^{T}(\Delta t_k)
-+
-\mathbf{Q}_k
-\]
-
-The measurement matrix is:
-
-\[
-\mathbf{H}
-=
-\begin{bmatrix}
-\mathbf{I}_4 & \mathbf{0}_4
-\end{bmatrix}
-\]
-
----
-
-## 7. Kalman Measurement Update
-
-For a matched detection:
-
-\[
-\mathbf{y}_k
-=
-\mathbf{z}_k
--
-\mathbf{H}\hat{\mathbf{x}}_k^{-}
-\]
-
-\[
-\mathbf{S}_k
-=
-\mathbf{H}\mathbf{P}_k^{-}\mathbf{H}^{T}
-+
-\mathbf{R}_k
-\]
-
-\[
-\mathbf{K}_k
-=
-\mathbf{P}_k^{-}\mathbf{H}^{T}\mathbf{S}_k^{-1}
-\]
-
-\[
-\hat{\mathbf{x}}_k^{+}
-=
-\hat{\mathbf{x}}_k^{-}
-+
-\mathbf{K}_k\mathbf{y}_k
-\]
-
-For numerical stability, use the Joseph covariance update:
-
-\[
-\mathbf{P}_k^{+}
-=
-(\mathbf{I}-\mathbf{K}_k\mathbf{H})
-\mathbf{P}_k^{-}
-(\mathbf{I}-\mathbf{K}_k\mathbf{H})^{T}
-+
-\mathbf{K}_k\mathbf{R}_k\mathbf{K}_k^{T}
-\]
-
----
-
-## 8. Timestamp Handling
-
-The Kalman transition interval must be calculated from event-window timestamps:
-
-\[
-\Delta t_k
-=
-t_k^{\mathrm{window\ end}}
--
-t_{k-1}^{\mathrm{window\ end}}
-\]
-
-Do not use:
-
-- inference completion time;
-- CPU callback intervals;
-- an assumed fixed frame rate when the stride varies.
-
-For example, if two event windows end 20 ms apart:
-
-\[
-\Delta t_k = 0.020 \text{ s}
-\]
-
-even when inference takes an additional 10–15 ms.
-
-### Window duration versus stride
-
-- **Window duration**: the amount of event history represented.
-- **Window stride**: the interval between consecutive detector calls.
-
-The stride determines the real-time processing budget.
-
----
-
-## 9. Process Noise
-
-For one position–velocity pair, use the structured constant-acceleration covariance:
-
-\[
-\mathbf{Q}_i(\Delta t)
-=
-\sigma_{a,i}^{2}
-\begin{bmatrix}
-\frac{\Delta t^4}{4} & \frac{\Delta t^3}{2} \\
-\frac{\Delta t^3}{2} & \Delta t^2
-\end{bmatrix}
-\]
-
-Use separate process-noise values for:
-
-\[
-\sigma_{a,x},
-\quad
-\sigma_{a,y},
-\quad
-\sigma_{a,w},
-\quad
-\sigma_{a,h}
-\]
-
-This is preferable to specifying or learning every element of a dense \(8 \times 8\) matrix.
-
----
-
-## 10. Measurement Noise
-
-Initially use:
-
-\[
-\mathbf{R}
-=
-\operatorname{diag}
-\left(
-\sigma_{c_x}^{2},
-\sigma_{c_y}^{2},
-\sigma_w^{2},
-\sigma_h^{2}
-\right)
-\]
-
-These values describe detector localization uncertainty.
-
-During the first stage:
-
-- \(\mathbf{Q}\) is fixed;
-- \(\mathbf{R}\) is fixed;
-- \(\mathbf{P}_0\) is fixed;
-- all KF matrices are excluded from the optimizer.
-
----
-
-## 11. KF Prior Maps
-
-A detector cannot directly consume an arbitrary list of KF state vectors. The predicted states must be converted into spatial maps aligned with the event tensor.
-
-For DAVIS346, the standard spatial resolution is:
+For DAVIS346:
 
 \[
 H = 260,
@@ -407,166 +174,166 @@ H = 260,
 W = 346
 \]
 
-The recommended prior channels are:
-
-1. occupancy map;
-2. reliability map;
-3. age map.
-
-An optional later extension can include velocity maps.
+The first implementation can store full-frame maps. A later optimized version can store sparse object-centered memory components and rasterize them into full-frame maps only before detector inference.
 
 ---
 
-## 12. Occupancy Prior
+## 7. Event Support
 
-For predicted pedestrian \(j\):
+The memory should distinguish between:
 
-\[
-\boldsymbol{\mu}_j
-=
-\begin{bmatrix}
-\hat{c}_{x,j}^{-} \\
-\hat{c}_{y,j}^{-}
-\end{bmatrix}
-\]
+- areas with fresh event evidence;
+- areas with weak but plausible evidence;
+- areas with no recent event support;
+- areas where absence of events is expected;
+- areas where absence of events contradicts the current belief.
 
-Let \(\boldsymbol{\Sigma}_j\) be the positional covariance extracted from \(\mathbf{P}_j^{-}\).
-
-Construct:
+A simple event-support map can be computed from the current event representation:
 
 \[
-G_j(u,v)
-=
-\exp
-\left[
--\frac{1}{2}
+S_k(u,v) =
+\operatorname{clip}
 \left(
-\mathbf{r}
--
-\boldsymbol{\mu}_j
-\right)^{T}
-\boldsymbol{\Sigma}_j^{-1}
-\left(
-\mathbf{r}
--
-\boldsymbol{\mu}_j
-\right)
-\right]
-\]
-
-with:
-
-\[
-\mathbf{r}
-=
-\begin{bmatrix}
-u \\
-v
-\end{bmatrix}
-\]
-
-Combine all pedestrians with:
-
-\[
-M_{\mathrm{occ}}(u,v)
-=
-\max_j G_j(u,v)
-\]
-
-A probabilistic union is also possible:
-
-\[
-M_{\mathrm{occ}}
-=
-1-\prod_j(1-G_j)
-\]
-
-The maximum operator is simpler and should be used first.
-
----
-
-## 13. Reliability Prior
-
-A track-level reliability score can be defined as:
-
-\[
-r_j
-=
-\exp
-\left[
--\lambda_P
-\operatorname{tr}(\boldsymbol{\Sigma}_j)
-\right]
-\exp(-\lambda_m m_j)
-\]
-
-where:
-
-- \(\boldsymbol{\Sigma}_j\): positional covariance;
-- \(m_j\): number of consecutive missed observations.
-
-The reliability map becomes:
-
-\[
-M_{\mathrm{rel}}(u,v)
-=
-\max_j
-\left[
-r_jG_j(u,v)
-\right]
-\]
-
-This map tells the detector whether a predicted region is reliable.
-
----
-
-## 14. Age Prior
-
-Define:
-
-\[
-a_j
-=
-\min
-\left(
-\frac{\tau_j}{\tau_{\max}},
+\frac{N_k(u,v)}{N_{\mathrm{ref}}},
+0,
 1
 \right)
 \]
 
-where:
+where \(N_k(u,v)\) is a local event count or event-energy measure.
 
-- \(\tau_j\): time since the last matched detection;
-- \(\tau_{\max}\): maximum retained missed duration.
-
-Then:
-
-\[
-M_{\mathrm{age}}(u,v)
-=
-\max_j
-\left[
-a_jG_j(u,v)
-\right]
-\]
-
-A low value corresponds to a recent state. A high value corresponds to a stale state.
+The support map does not directly decide detection. It modulates memory reliability and uncertainty.
 
 ---
 
-## 15. Neural Network Input
+## 8. Temporal Memory Propagation
 
-The detector input becomes:
+Before using the current event window, propagate the previous memory forward:
 
 \[
-\mathbf{X}_k
-=
+\bar{B}_k =
+\alpha_B B_{k-1}
+\]
+
+\[
+\bar{U}_k =
+\operatorname{clip}
+\left(
+U_{k-1} + \alpha_U \Delta t_k,
+0,
+1
+\right)
+\]
+
+\[
+\bar{A}_k =
+\operatorname{clip}
+\left(
+A_{k-1} + \alpha_A \Delta t_k,
+0,
+1
+\right)
+\]
+
+where \(\Delta t_k\) is computed from event-window timestamps:
+
+\[
+\Delta t_k =
+t_k^{\mathrm{window\ end}}
+-
+t_{k-1}^{\mathrm{window\ end}}
+\]
+
+Do not use inference completion time or CPU callback intervals as the memory timestep.
+
+The first version can use simple decay and uncertainty growth. Later versions may add event-flow-based memory warping or learned propagation.
+
+---
+
+## 9. Detection-Informed Memory Update
+
+Current detections reinforce memory. For a detected pedestrian box \(d_j\), create a soft box or Gaussian support map \(D_j(u,v)\). Combine all detections:
+
+\[
+D_k(u,v) =
+\max_j D_j(u,v)
+\]
+
+Then update belief:
+
+\[
+B_k =
+\operatorname{clip}
+\left(
+\beta_B \bar{B}_k
++
+(1-\beta_B)D_k,
+0,
+1
+\right)
+\]
+
+Update uncertainty:
+
+\[
+U_k =
+\operatorname{clip}
+\left(
+\bar{U}_k(1 - \eta_D D_k)
++
+\eta_S(1-S_k)\bar{B}_k,
+0,
+1
+\right)
+\]
+
+This means:
+
+- detections reduce uncertainty locally;
+- missing event support can increase uncertainty where belief remains high;
+- stale belief gradually becomes less reliable;
+- the detector can still override memory because the priors are soft.
+
+---
+
+## 10. Event-Silence Awareness
+
+Event silence is not always negative evidence.
+
+A pedestrian who slows down or stops may generate few events, but may still be present. Therefore, the memory should not immediately erase pedestrian belief just because the current event count is low.
+
+Recommended first policy:
+
+- low event support increases uncertainty;
+- repeated low support increases age;
+- belief decays slowly instead of disappearing immediately;
+- detections reset uncertainty and age locally;
+- very stale and uncertain memory is suppressed.
+
+This is a central event-camera-specific part of the method. The system should learn that absence of events can mean either disappearance or temporary low motion, depending on temporal context.
+
+---
+
+## 11. Prior Maps
+
+The detector input should include memory priors such as:
+
+1. belief map \(M_{\mathrm{bel}}\);
+2. uncertainty map \(M_{\mathrm{unc}}\);
+3. age map \(M_{\mathrm{age}}\);
+4. event-support map \(M_{\mathrm{sup}}\).
+
+The recommended first input is:
+
+\[
+\mathbf{X}_k =
 \operatorname{concat}
 \left(
 \mathbf{E}_k,
-M_{\mathrm{occ},k},
-M_{\mathrm{rel},k},
-M_{\mathrm{age},k}
+M_{\mathrm{bel},k},
+M_{\mathrm{unc},k},
+M_{\mathrm{age},k},
+M_{\mathrm{sup},k}
 \right)
 \]
 
@@ -574,7 +341,7 @@ Example:
 
 ```python
 # event_tensor: [B, C_event, 260, 346]
-# prior_tensor: [B, 3,       260, 346]
+# prior_tensor: [B, 4,       260, 346]
 
 model_input = torch.cat(
     [event_tensor, prior_tensor],
@@ -588,243 +355,99 @@ The network must then be retrained or fine-tuned.
 
 ---
 
-## 16. Why the Priors Must Be Soft
+## 12. Why the Priors Must Be Soft
 
-The KF priors must not be used to discard full-frame event information.
+The memory priors must not be used to discard full-frame event information.
 
 Do not:
 
-- remove events outside predicted boxes;
-- process only tracked pedestrian regions;
+- remove events outside high-belief regions;
+- process only remembered pedestrian regions;
 - hard-mask the background;
-- crop exclusively around active tracks.
+- crop exclusively around memory hypotheses.
 
 Hard masking would prevent the detector from discovering:
 
 - newly entering pedestrians;
-- pedestrians after track failure;
+- pedestrians after memory failure;
 - pedestrians following unexpected motion;
 - pedestrians outside all existing priors.
 
 The detector must be able to:
 
-- use a reliable prior;
-- ignore an unreliable prior;
-- override a wrong prior;
-- detect a pedestrian without any prior.
+- use reliable memory;
+- ignore uncertain memory;
+- override wrong memory;
+- detect a pedestrian without any memory prior.
 
 ---
 
-## 17. Internal Tracking Requirements
+## 13. Object-Centered Memory Option
 
-Although the final objective is detection enhancement, the KF requires internal track-state management.
+The simplest design stores full-frame memory maps. A more efficient and more interpretable variant stores object-centered memory components:
 
-The implementation needs:
+\[
+h_i =
+\{c_x,c_y,w,h,e_i,u_i,a_i,r_i\}
+\]
 
-- state initialization;
-- state confirmation;
-- detection-to-state association;
-- matched-state update;
-- missed-observation handling;
-- state deletion.
+where:
 
-Thus, internal tracking is required even when track IDs are not final outputs.
+- \(c_x,c_y,w,h\): spatial support of the hypothesis;
+- \(e_i\): latent event-memory embedding;
+- \(u_i\): uncertainty;
+- \(a_i\): age;
+- \(r_i\): reliability.
+
+Each hypothesis is rasterized into full-frame prior maps before inference. This keeps the detector interface unchanged while allowing memory to be managed sparsely.
+
+This object-centered version resembles internal tracking, but the final purpose remains detection improvement through prior generation.
 
 ---
 
-## 18. Detection-to-State Association
+## 14. Relation to Kalman and Particle Filters
 
-Use a cost combining motion consistency and bounding-box overlap:
+A Kalman filter or particle filter can be viewed as a special case of a temporal prior generator.
 
-\[
-C_{ij}
-=
-\lambda_M d_{M,ij}^{2}
-+
-\lambda_{\mathrm{IoU}}
-\left(
-1-\operatorname{IoU}_{ij}
-\right)
-\]
-
-The squared Mahalanobis distance is:
-
-\[
-d_{M,ij}^{2}
-=
-\left(
-\mathbf{z}_j
--
-\mathbf{H}\hat{\mathbf{x}}_i^{-}
-\right)^{T}
-\mathbf{S}_i^{-1}
-\left(
-\mathbf{z}_j
--
-\mathbf{H}\hat{\mathbf{x}}_i^{-}
-\right)
-\]
-
-Use Mahalanobis gating before Hungarian assignment:
-
-\[
-d_{M,ij}^{2}
-<
-\gamma
-\]
-
-Do not use IoU alone. Event-based boxes can shift significantly between short windows.
-
----
-
-## 19. Track Initialization
-
-An unmatched detection initializes:
-
-\[
-\hat{\mathbf{x}}_0
-=
-[c_x,c_y,w,h,0,0,0,0]^T
-\]
-
-The initial velocity covariance should be relatively large.
-
-A newly created state should initially be tentative.
-
-Recommended policy:
-
-- confirm after two or three consistent matches;
-- use no prior or a weak prior while tentative;
-- delete quickly when the tentative state is not confirmed.
-
----
-
-## 20. Missed Observations
-
-When a state is unmatched:
-
-1. retain the prediction;
-2. allow covariance to grow;
-3. increase missed duration;
-4. reduce reliability;
-5. weaken its prior;
-6. delete after a time-based maximum age.
-
-Use elapsed time:
-
-\[
-\tau_{\mathrm{miss}}
-=
-t_k
--
-t_{\mathrm{last\ matched}}
-\]
-
-instead of relying only on frame count.
-
----
-
-## 21. State Deletion
-
-Delete a state when:
-
-- missed duration exceeds \(\tau_{\max}\);
-- covariance becomes too large;
-- predicted box remains outside the sensor field;
-- width or height becomes invalid;
-- reliability becomes too low.
-
-A stale KF prediction must not persist indefinitely.
-
----
-
-## 22. Training Strategy
-
-### Key clarification
-
-The recommended KF is:
-
-- **present during training**;
-- **present during deployment**;
-- **not learnable initially**.
-
-The KF participates in the training data flow because the neural detector must learn how to interpret the prior channels.
-
-During the first stage, the optimizer updates only:
-
-\[
-\theta_{\mathrm{EventFPN}},
-\quad
-\theta_{\mathrm{ConvGRU}},
-\quad
-\theta_{\mathrm{detection\ head}}
-\]
-
-It does not update:
-
-\[
-\mathbf{F},
-\quad
-\mathbf{H},
-\quad
-\mathbf{Q},
-\quad
-\mathbf{R},
-\quad
-\mathbf{P}_0
-\]
-
----
-
-## 23. Training Flow
+However, the recommended framing is broader:
 
 ```text
-Previous boxes or detections
+Temporal state estimator
         ↓
-Fixed KF update
+uncertainty-aware spatial priors
         ↓
-Fixed KF prediction
-        ↓
-Occupancy / reliability / age maps
-        ↓
-Current event tensor + KF maps
-        ↓
-EventFPN + ConvGRU
-        ↓
-Detection head
-        ↓
-Detection loss
-        ↓
-Update neural-network weights only
+event-based detector
 ```
 
-The deployed network must receive the same type of input channels that it saw during training.
+A linear Kalman filter provides one Gaussian hypothesis per object. A particle filter provides multiple weighted hypotheses per object. The proposed event memory instead maintains spatial belief and uncertainty fields that can be updated by event support, event silence, and detector confidence.
 
-Do not train with events only and then append KF channels only at deployment.
+This makes the approach more event-native than a traditional tracker because the memory is not only propagated from box kinematics; it is also conditioned on the structure and absence of events.
 
 ---
 
-## 24. Sequential Training
+## 15. Training Strategy
 
-The training samples must preserve temporal order.
+The memory must be present during both training and deployment.
 
-At time \(k\):
+During training:
 
-1. obtain the previous state;
-2. predict it to timestamp \(t_k\);
-3. create priors using only information available before \(t_k\);
-4. process the current event tensor;
-5. compute the current detection loss;
-6. update the ConvGRU hidden state;
+1. process event windows in temporal order;
+2. propagate previous memory to timestamp \(t_k\);
+3. build priors using only information available before or within the current causal window;
+4. run EventFPN-ConvGRU on current events plus memory priors;
+5. compute detection loss;
+6. update memory using detections, ground-truth-assisted signals, or scheduled sampling;
 7. continue to the next timestamp.
 
-Do not construct the current prior from the current ground-truth box, because that would leak the target into the input.
+Do not train the detector with event-only tensors and append memory channels only at deployment.
+
+Do not construct the current prior directly from the current ground-truth box before inference. That leaks the answer into the input.
 
 ---
 
-## 25. Teacher Forcing
+## 16. Teacher Forcing and Scheduled Sampling
 
-At the beginning of training, KF updates can use noisy previous ground-truth boxes:
+At the beginning of training, the memory can be updated using noisy previous ground-truth boxes:
 
 \[
 \tilde{\mathbf{z}}_{k-1}
@@ -834,142 +457,87 @@ At the beginning of training, KF updates can use noisy previous ground-truth box
 \boldsymbol{\epsilon}
 \]
 
-Then gradually replace teacher-forced updates with detector predictions.
+Then gradually replace teacher-forced memory updates with detector-generated updates.
 
 Recommended sequence:
 
 1. noisy previous ground-truth boxes;
 2. mixture of ground truth and predictions;
-3. mostly predicted boxes;
-4. fully online detector-generated updates.
+3. mostly predicted detections;
+4. fully online detector-generated memory updates.
 
-This reduces the train–deployment mismatch.
+This reduces the train-deployment mismatch.
 
 ---
 
-## 26. Prior Corruption
+## 17. Memory Corruption
 
-Perfect priors create overdependence.
+Perfect memory creates overdependence.
 
 During training, randomly simulate:
 
-- center-position errors;
-- width and height errors;
-- incorrect velocity;
-- missed states;
-- false states;
-- stale states;
-- covariance inflation;
-- complete prior dropout.
+- shifted belief regions;
+- inflated uncertainty;
+- missing memory regions;
+- false memory regions;
+- stale memory;
+- weak event support;
+- noisy event support;
+- complete memory dropout.
 
-For prior dropout:
+For complete memory dropout:
 
 \[
-\mathbf{M}_k = \mathbf{0}
+M_k = 0
 \]
 
 for a random percentage of training windows.
 
-The detector must remain functional when no valid KF prior exists.
+The detector must remain functional when no valid memory prior exists.
 
 ---
 
-## 27. Learnable KF Extension
+## 18. Optional Learnable Memory Dynamics
 
-Only after the fixed-KF version demonstrates an improvement should KF parameters be made learnable.
+Only after the fixed memory version demonstrates improvement should memory dynamics be made learnable.
 
-Keep fixed:
+Potential learnable components:
 
-\[
-\mathbf{F}(\Delta t),
-\qquad
-\mathbf{H}
-\]
+- belief decay rate;
+- uncertainty growth rate;
+- event-support weighting;
+- detection-confidence weighting;
+- age suppression;
+- memory update gates;
+- small convolutional memory-update module.
 
-Potentially learn:
-
-\[
-\boldsymbol{\theta}_Q
-=
-[
-\sigma_{a,x},
-\sigma_{a,y},
-\sigma_{a,w},
-\sigma_{a,h}
-]
-\]
-
-and:
+A learnable update can be written as:
 
 \[
-\boldsymbol{\theta}_R
-=
-[
-\sigma_{c_x},
-\sigma_{c_y},
-\sigma_w,
-\sigma_h
-]
-\]
-
-Guarantee positive variances using:
-
-\[
-\sigma^2
-=
-\operatorname{softplus}(\rho)
-+
-\epsilon
-\]
-
-Do not initially learn:
-
-- the full transition matrix;
-- the measurement matrix;
-- every covariance element;
-- the Kalman gain;
-- a neural replacement for the KF equations.
-
----
-
-## 28. Optional Adaptive Measurement Noise
-
-A later extension may predict the measurement covariance from:
-
-\[
-\mathbf{R}_k
-=
-r_{\phi}
+\mathcal{M}_k =
+g_{\phi}
 \left(
-s_k,
-N_{\mathrm{events},k},
-w_k,
-h_k,
-\tau_k
+\mathcal{M}_{k-1},
+\mathbf{E}_k,
+\mathbf{D}_k,
+\Delta t_k
 \right)
 \]
 
-where:
+where \(g_{\phi}\) should remain lightweight enough for real-time execution.
 
-- \(s_k\): detector confidence;
-- \(N_{\mathrm{events},k}\): local event count;
-- \(w_k,h_k\): box size;
-- \(\tau_k\): state age.
-
-A very small MLP can output four positive variances.
-
-This should remain compatible with real-time execution.
+Avoid making the first version a large unconstrained recurrent module. Start with interpretable fixed dynamics, then learn small structured update parameters.
 
 ---
 
-## 29. Real-Time Requirement
+## 19. Real-Time Requirement
 
 The complete runtime must satisfy:
 
 \[
 T_{\mathrm{repr}}
 +
-T_{\mathrm{KF}}
+T_{\mathrm{memory}}
 +
 T_{\mathrm{prior}}
 +
@@ -983,10 +551,10 @@ T_{\mathrm{stride}}
 where:
 
 - \(T_{\mathrm{repr}}\): event representation;
-- \(T_{\mathrm{KF}}\): KF prediction and update;
+- \(T_{\mathrm{memory}}\): memory propagation and update;
 - \(T_{\mathrm{prior}}\): prior-map generation;
-- \(T_{\mathrm{network}}\): EventFPN–ConvGRU inference;
-- \(T_{\mathrm{post}}\): decoding, NMS, association, and state management.
+- \(T_{\mathrm{network}}\): EventFPN-ConvGRU inference;
+- \(T_{\mathrm{post}}\): decoding, NMS, and memory-management logic.
 
 For a 40 ms stride:
 
@@ -1004,91 +572,41 @@ The stride, not the window duration, determines the computational budget.
 
 ---
 
-## 30. Computational Complexity
+## 20. Computational Guidance
 
-The KF operates on small \(8 \times 8\) matrices.
+Avoid Python loops over all image pixels.
 
-Its cost scales mainly with the number of active states:
+Recommended implementation choices:
 
-\[
-O(N_{\mathrm{tracks}})
-\]
+- keep memory maps as PyTorch tensors;
+- update full-frame maps with vectorized operations;
+- rasterize object-centered hypotheses only inside bounded regions;
+- avoid repeated CPU-GPU copies;
+- keep event representation, prior maps, and network input on the same device;
+- profile memory-update time separately from network inference time.
 
-This is normally negligible compared with EventFPN and ConvGRU inference.
-
-Avoid full-frame Gaussian generation in Python loops.
-
-Generate each Gaussian only inside:
-
-\[
-\hat{c}_x \pm 3\sigma_x,
-\qquad
-\hat{c}_y \pm 3\sigma_y
-\]
-
-and use vectorized PyTorch or CUDA operations.
+If using object-centered memory, generate each local prior only inside a bounded support region rather than over the entire sensor.
 
 ---
 
-## 31. Real-Time Execution Pipeline
-
-```text
-Thread 1: DAVIS346 event acquisition
-    └── Push timestamped events into a ring buffer
-
-Thread 2: event representation construction
-    └── Build the next event tensor
-
-CPU tracking stage
-    ├── Predict KF states
-    ├── Associate detections
-    ├── Update states
-    └── Manage state creation and deletion
-
-GPU stage
-    ├── Generate or receive prior maps
-    ├── Concatenate event and prior channels
-    ├── Run EventFPN
-    ├── Run ConvGRU
-    └── Run the detection head
-```
-
-Use double buffering:
-
-```text
-Buffer A: currently processed
-Buffer B: currently filled from DAVIS346
-```
-
-Event acquisition should continue while the previous window is being processed.
-
----
-
-## 32. Operations to Avoid
+## 21. Operations to Avoid
 
 Do not use:
 
-- one KF update per raw event;
-- event-to-track association for every event;
-- one KF per pixel;
-- Python loops over all image pixels;
+- one memory update per raw event in Python;
+- one state per pixel with expensive per-pixel control flow;
+- hard memory-guided cropping;
+- raw-event filtering outside remembered areas;
 - synchronous camera acquisition and inference;
-- hard Kalman-guided cropping;
-- full ConvGRU hidden-state warping;
 - repeated CPU-to-GPU copies;
-- a fully learned recurrent Kalman replacement in the first version.
+- a large fully learned memory network in the first version;
+- training priors that use current ground truth before inference.
 
-Per-event association would approximately cost:
-
-\[
-O(N_{\mathrm{events}}N_{\mathrm{tracks}})
-\]
-
-and is not justified for the recommended design.
+The memory should guide detection, not constrain what the detector is allowed to see.
 
 ---
 
-## 33. Evaluation Metrics
+## 22. Evaluation Metrics
 
 Because detection improvement is the main objective, prioritize:
 
@@ -1101,7 +619,7 @@ Because detection improvement is the main objective, prioritize:
 - false-negative rate;
 - localization error.
 
-Evaluate difficult conditions separately:
+Evaluate difficult event-camera conditions separately:
 
 - low event density;
 - slow pedestrian motion;
@@ -1109,44 +627,47 @@ Evaluate difficult conditions separately:
 - rapid camera motion;
 - partial occlusion;
 - crowded scenes;
-- new pedestrian entry.
+- new pedestrian entry;
+- intermittent detections;
+- high background event activity.
 
 ---
 
-## 34. Internal KF Diagnostics
+## 23. Memory Diagnostics
 
 Inspect:
 
-- innovation residual;
-- Mahalanobis distance;
-- covariance growth;
-- missed duration;
-- prediction drift;
-- association failures;
-- state fragmentation;
-- prior reliability.
+- belief-map quality;
+- uncertainty calibration;
+- age-map behavior;
+- event-support response;
+- memory persistence during low-event intervals;
+- false memory persistence;
+- missed pedestrian recovery;
+- detector dependence on priors;
+- behavior under complete memory dropout.
 
-Optional tracking metrics:
+Optional tracking-style diagnostics may still be useful:
 
-- HOTA;
-- IDF1;
 - ID switches;
-- fragmentation.
+- fragmentation;
+- hypothesis lifetime;
+- association failures.
 
-These are diagnostic metrics, even when tracking is not the final objective.
+These are diagnostics only. The main output remains pedestrian detections.
 
 ---
 
-## 35. Real-Time Metrics
+## 24. Real-Time Metrics
 
 Measure:
 
 - event-representation time;
-- KF prediction time;
+- memory propagation time;
+- memory update time;
 - prior-map generation time;
 - neural-network inference time;
 - decoding and NMS time;
-- association and state-update time;
 - end-to-end latency;
 - dropped events;
 - event-buffer backlog.
@@ -1179,16 +700,17 @@ T_{\mathrm{stride}}
 
 ---
 
-## 36. Ablation Study
+## 25. Ablation Study
 
-| Configuration | Event input | KF information | Learnable KF parameters |
+| Configuration | Event input | Memory information | Learnable memory |
 |---|---|---|---|
 | A | Original event tensor | None | No |
-| B | Original event tensor | Occupancy map | No |
-| C | Original event tensor | Occupancy + reliability + age | No |
-| D | Original event tensor | Occupancy + reliability + age | Structured \(\mathbf{Q},\mathbf{R}\) |
-| E | Original event tensor | Adaptive covariance priors | Small covariance network |
-| F | Optional ego-motion-compensated events | Fixed KF priors | Optional |
+| B | Original event tensor | Belief map | No |
+| C | Original event tensor | Belief + uncertainty + age + support | No |
+| D | Original event tensor | Same as C with memory corruption training | No |
+| E | Original event tensor | Same as C | Structured learnable update gates |
+| F | Original event tensor | Object-centered memory priors | Optional |
+| G | Motion-compensated events | Uncertainty-aware memory priors | Optional |
 
 The most important initial comparison is:
 
@@ -1196,101 +718,82 @@ The most important initial comparison is:
 \text{A versus C}
 \]
 
-Only when C clearly outperforms A should learnable covariance parameters be introduced.
+Only when C clearly outperforms A should learnable memory dynamics be introduced.
 
 ---
 
-## 37. Recommended Development Phases
+## 26. Recommended Development Phases
 
-### Phase 1 — Baseline profiling
+### Phase 1 - Baseline profiling
 
-Measure the original EventFPN–ConvGRU system:
+Measure the original EventFPN-ConvGRU system:
 
 - AP;
 - recall;
 - latency;
 - memory;
-- event-buffer behavior.
+- event-buffer behavior;
+- performance under low-event-density windows.
 
-### Phase 2 — KF state bank
+### Phase 2 - Fixed full-frame memory maps
 
 Implement:
 
-- state initialization;
-- prediction;
-- association;
-- measurement update;
-- missed-state handling;
-- state deletion.
+- belief map;
+- uncertainty map;
+- age map;
+- event-support map;
+- timestamp-based propagation;
+- detection-informed update;
+- memory reset at sequence boundaries.
 
-Do not yet modify the detector.
+Do not yet make the memory learnable.
 
-### Phase 3 — Fixed prior maps
+### Phase 3 - Detector input integration
 
-Add:
+Add memory prior channels to the EventFPN input.
 
-\[
-M_{\mathrm{occ}},
-\quad
-M_{\mathrm{rel}},
-\quad
-M_{\mathrm{age}}
-\]
+Retrain or fine-tune the detector using temporally ordered sequences.
 
-Change the EventFPN input channels.
-
-Retrain or fine-tune the network.
-
-### Phase 4 — Robust sequential training
+### Phase 4 - Robust sequential training
 
 Add:
 
 - teacher forcing;
 - scheduled sampling;
-- prior noise;
-- false priors;
-- missing priors;
-- prior dropout.
+- memory corruption;
+- false memory regions;
+- missing memory regions;
+- complete memory dropout.
 
-### Phase 5 — KF calibration
+### Phase 5 - Memory calibration
 
 Tune:
 
-- \(\mathbf{Q}\);
-- \(\mathbf{R}\);
-- \(\mathbf{P}_0\);
-- gating threshold;
-- maximum missed duration;
-- tentative-track confirmation;
-- prior reliability thresholds.
+- belief decay;
+- uncertainty growth;
+- age growth;
+- event-support scaling;
+- detection-confidence weighting;
+- stale-memory suppression threshold.
 
-### Phase 6 — Learnable covariance scalars
+### Phase 6 - Learnable structured memory
 
-Make selected \(\mathbf{Q}\) and \(\mathbf{R}\) parameters learnable.
+Make selected memory update rates or gates learnable.
 
 Compare against the fixed version.
 
-### Phase 7 — Optional ego-motion EKF
+### Phase 7 - Optional object-centered memory
 
-For new DAVIS346 recordings with synchronized IMU data:
+Replace full-frame memory storage with sparse object-centered hypotheses while preserving the same prior-map interface.
 
-```text
-DAVIS events + IMU
-        ↓
-Camera-motion EKF
-        ↓
-Ego-motion-compensated event stream
-        ↓
-Event representation
-        ↓
-EventFPN–ConvGRU with pedestrian KF priors
-```
+### Phase 8 - Optional motion-compensated memory
 
-The camera-motion EKF and pedestrian bounding-box KF should remain separate modules.
+Use event-derived local motion or ego-motion compensation to shift memory forward before generating priors.
 
 ---
 
-## 38. Final Recommended Pipeline
+## 27. Final Recommended Pipeline
 
 \[
 \boxed{
@@ -1299,13 +802,13 @@ The camera-motion EKF and pedestrian bounding-box KF should remain separate modu
 \rightarrow
 \text{event representation}
 \\
-&\text{previous detections}
+&\text{previous memory}
 \rightarrow
-\text{per-pedestrian linear KF prediction}
+\text{uncertainty-aware propagation}
 \rightarrow
-\text{soft prior maps}
+\text{soft spatial priors}
 \\
-&[\text{event representation},\text{prior maps}]
+&[\text{event representation},\text{memory priors}]
 \rightarrow
 \text{EventFPN}
 \rightarrow
@@ -1313,11 +816,9 @@ The camera-motion EKF and pedestrian bounding-box KF should remain separate modu
 \rightarrow
 \text{pedestrian detections}
 \\
-&\text{detections}
+&\text{detections + event support}
 \rightarrow
-\text{association}
-\rightarrow
-\text{KF update}
+\text{memory update}
 \rightarrow
 \text{next inference cycle}
 \end{aligned}
@@ -1326,38 +827,36 @@ The camera-motion EKF and pedestrian bounding-box KF should remain separate modu
 
 ---
 
-## 39. Final Recommendation
+## 28. Final Recommendation
 
 The first implementation should use:
 
-- a fixed linear KF;
-- fixed \(\mathbf{F}\) and \(\mathbf{H}\);
-- fixed and validated \(\mathbf{Q}\), \(\mathbf{R}\), and \(\mathbf{P}_0\);
-- occupancy, reliability, and age prior maps;
+- fixed uncertainty-aware memory dynamics;
+- belief, uncertainty, age, and event-support prior maps;
 - full-frame event input;
-- vectorized prior generation;
-- asynchronous acquisition and inference;
-- no raw-event filtering;
+- vectorized memory updates;
+- timestamp-based propagation;
+- causal sequential training;
+- memory corruption and dropout;
 - no hard cropping;
-- no per-event KF updates;
-- no learned Kalman gain;
-- no fully learned KF replacement.
+- no raw-event filtering;
+- no large learned memory module in the first version.
 
-The KF must be present during training and deployment, but it should initially remain frozen.
+The memory must be present during training and deployment.
 
-The neural network learns how to use the KF-generated priors.
+The neural network learns how to use the memory-generated priors.
 
-Only after the fixed architecture demonstrates a clear benefit should structured covariance parameters be made learnable.
+Only after the fixed memory architecture demonstrates a clear detection benefit should structured learnable memory dynamics be introduced.
 
 ---
 
-## 40. Technical Summary
+## 29. Technical Summary
 
 The most accurate statement of the method is:
 
 \[
 \boxed{
-\text{The KF performs lightweight internal state tracking to enhance future pedestrian detection inference.}
+\text{An uncertainty-aware event memory generates causal spatial priors to enhance future pedestrian detection inference.}
 }
 \]
 
@@ -1365,22 +864,22 @@ The recommended research sequence is:
 
 \[
 \boxed{
-\text{Fixed KF priors}
+\text{Fixed event memory priors}
 \rightarrow
 \text{validate detection improvement}
 \rightarrow
-\text{tune KF covariances}
+\text{calibrate memory dynamics}
 \rightarrow
-\text{optionally learn structured } \mathbf{Q},\mathbf{R}
+\text{optionally learn structured update gates}
 }
 \]
 
 This design provides a practical balance among:
 
-- mathematical validity;
+- event-camera specificity;
+- temporal persistence;
+- uncertainty awareness;
 - real-time feasibility;
-- interpretability;
-- numerical stability;
 - compatibility with EventFPN and ConvGRU;
 - controlled ablation;
-- robustness to sparse or intermittent event observations.
+- robustness to sparse, intermittent, or ambiguous event observations.
