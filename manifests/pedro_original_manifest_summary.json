@@ -1,0 +1,160 @@
+{
+  "accepted_windows": 32072,
+  "check_monotonic": true,
+  "dataset_root": "/media/birb/grvc/PEDRo_original",
+  "max_sequence_gap_us": 1000000,
+  "object_count_histogram": {
+    "0": 3615,
+    "1": 18127,
+    "2": 6886,
+    "3": 671,
+    "4": 1965,
+    "5": 808
+  },
+  "parts": {
+    "live_person_only/train": {
+      "accepted_windows": 1459,
+      "duration_us_max": 40000,
+      "duration_us_min": 39766,
+      "empty_windows": 0,
+      "num_events_max": 25737,
+      "num_events_min": 1440,
+      "object_count_histogram": {
+        "1": 363,
+        "2": 1096
+      },
+      "sequence_break_reasons": {
+        "first_accepted_window": 1,
+        "timestamp_gap_gt_1000000us": 1
+      },
+      "sequence_count": 2,
+      "total_boxes": 2555,
+      "total_events": 8055926
+    },
+    "main/test": {
+      "accepted_windows": 3823,
+      "duration_us_max": 1126192,
+      "duration_us_min": 11160,
+      "empty_windows": 1,
+      "num_events_max": 1504387,
+      "num_events_min": 569,
+      "object_count_histogram": {
+        "0": 1,
+        "1": 3598,
+        "2": 139,
+        "3": 57,
+        "4": 8,
+        "5": 20
+      },
+      "sequence_break_reasons": {
+        "first_accepted_window": 1,
+        "negative_timestamp_gap": 1,
+        "timestamp_gap_gt_1000000us": 116
+      },
+      "sequence_count": 118,
+      "total_boxes": 4179,
+      "total_events": 396151660
+    },
+    "main/train": {
+      "accepted_windows": 19226,
+      "duration_us_max": 426830,
+      "duration_us_min": 14070,
+      "empty_windows": 0,
+      "num_events_max": 1188368,
+      "num_events_min": 36,
+      "object_count_histogram": {
+        "1": 10473,
+        "2": 5457,
+        "3": 608,
+        "4": 1945,
+        "5": 743
+      },
+      "sequence_break_reasons": {
+        "first_accepted_window": 1,
+        "negative_timestamp_gap": 3,
+        "timestamp_gap_gt_1000000us": 59
+      },
+      "sequence_count": 63,
+      "total_boxes": 34706,
+      "total_events": 789994060
+    },
+    "main/val": {
+      "accepted_windows": 3950,
+      "duration_us_max": 230368,
+      "duration_us_min": 36375,
+      "empty_windows": 0,
+      "num_events_max": 412903,
+      "num_events_min": 92,
+      "object_count_histogram": {
+        "1": 3693,
+        "2": 194,
+        "3": 6,
+        "4": 12,
+        "5": 45
+      },
+      "sequence_break_reasons": {
+        "first_accepted_window": 1,
+        "timestamp_gap_gt_1000000us": 21
+      },
+      "sequence_count": 22,
+      "total_boxes": 4372,
+      "total_events": 223361773
+    },
+    "no_person_train/train": {
+      "accepted_windows": 2914,
+      "duration_us_max": 40000,
+      "duration_us_min": 40000,
+      "empty_windows": 2914,
+      "num_events_max": 345400,
+      "num_events_min": 719,
+      "object_count_histogram": {
+        "0": 2914
+      },
+      "sequence_break_reasons": {
+        "first_accepted_window": 1,
+        "timestamp_gap_gt_1000000us": 1
+      },
+      "sequence_count": 2,
+      "total_boxes": 0,
+      "total_events": 146382001
+    },
+    "no_person_val/val": {
+      "accepted_windows": 700,
+      "duration_us_max": 40000,
+      "duration_us_min": 40000,
+      "empty_windows": 700,
+      "num_events_max": 82955,
+      "num_events_min": 3719,
+      "object_count_histogram": {
+        "0": 700
+      },
+      "sequence_break_reasons": {
+        "first_accepted_window": 1
+      },
+      "sequence_count": 1,
+      "total_boxes": 0,
+      "total_events": 23871733
+    }
+  },
+  "rejected": [
+    {
+      "npy_path": "/media/birb/grvc/PEDRo_original/numpy/train/frame0010206.npy",
+      "reason": "ValueError: mmap length is greater than file size",
+      "split": "train",
+      "subset": "main",
+      "xml_path": "/media/birb/grvc/PEDRo_original/xml/train/frame0010206.xml"
+    },
+    {
+      "npy_path": "/media/birb/grvc/PEDRo_original/numpy/train/frame0010207.npy",
+      "reason": "ValueError: This file contains pickled (object) data. If you trust the file you can load it unsafely using the `allow_pickle=` keyword argument or `pickle.load()`.",
+      "split": "train",
+      "subset": "main",
+      "xml_path": "/media/birb/grvc/PEDRo_original/xml/train/frame0010207.xml"
+    }
+  ],
+  "rejected_windows": 2,
+  "sequence_count": 208,
+  "sequence_length_max": 2000,
+  "sequence_length_median": 31.5,
+  "sequence_length_min": 1
+}

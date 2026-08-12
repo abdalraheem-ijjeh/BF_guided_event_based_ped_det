@@ -1,0 +1,3 @@
+subset,split,npy_path,xml_path,reason
+main,train,/media/birb/grvc/PEDRo_original/numpy/train/frame0010206.npy,/media/birb/grvc/PEDRo_original/xml/train/frame0010206.xml,ValueError: mmap length is greater than file size
+main,train,/media/birb/grvc/PEDRo_original/numpy/train/frame0010207.npy,/media/birb/grvc/PEDRo_original/xml/train/frame0010207.xml,ValueError: This file contains pickled (object) data. If you trust the file you can load it unsafely using the `allow_pickle=` keyword argument or `pickle.load()`.
