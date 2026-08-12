@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Ignore common image formats
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.svg
+*.ico
+
+# Model weights / checkpoints
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+
+runs/**/real_ap_eval_epoch
