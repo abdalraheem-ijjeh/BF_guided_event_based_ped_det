@@ -261,12 +261,25 @@ def resize_prior_maps_to_detector(prior_maps: torch.Tensor, image_size: int) -> 
 
 def append_priors_to_stage_tensors(
     stage_tensors: Sequence[torch.Tensor],
-    prior_maps: torch.Tensor,
+    prior_maps: torch.Tensor | Sequence[torch.Tensor],
     *,
     image_size: int,
 ) -> list[torch.Tensor]:
-    detector_priors = resize_prior_maps_to_detector(prior_maps, image_size=image_size)
-    return [torch.cat([stage, detector_priors.to(device=stage.device, dtype=stage.dtype)], dim=1) for stage in stage_tensors]
+    if isinstance(prior_maps, torch.Tensor):
+        detector_priors = [resize_prior_maps_to_detector(prior_maps, image_size=image_size)] * len(stage_tensors)
+    else:
+        if len(prior_maps) != len(stage_tensors):
+            raise ValueError(
+                f"expected {len(stage_tensors)} prior tensors, got {len(prior_maps)}"
+            )
+        detector_priors = [
+            resize_prior_maps_to_detector(prior, image_size=image_size)
+            for prior in prior_maps
+        ]
+    return [
+        torch.cat([stage, prior.to(device=stage.device, dtype=stage.dtype)], dim=1)
+        for stage, prior in zip(stage_tensors, detector_priors)
+    ]
 
 
 def load_checkpoint_with_expanded_input(

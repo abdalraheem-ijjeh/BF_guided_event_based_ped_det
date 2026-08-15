@@ -12,14 +12,16 @@ This project explores a temporally aware event-based pedestrian detector built w
 
 The proposed extension is an **uncertainty-aware event memory** that generates soft spatial priors for the detector.
 
+Implementation note: the current code is a causal **detection-memory prior** with heuristic uncertainty. It does not perform motion compensation, identity association, optical/event-flow warping, or calibrated Bayesian uncertainty estimation. Those are future extensions, not properties of the current training pipeline.
+
 The memory is not a conventional post-processing tracker. Instead of only smoothing detections after inference, it maintains a persistent belief about where pedestrian evidence may continue to exist, how reliable that belief is, and how uncertain each spatial hypothesis has become over time.
 
 The detector receives the current event representation together with memory-generated prior maps.
 
 ```text
-Past event evidence + past detections
+Past detections + current event support
         ↓
-Uncertainty-aware event memory
+Heuristic uncertainty-aware detection memory
         ↓
 Spatial belief / uncertainty / age priors
         ↓
@@ -63,7 +65,7 @@ The memory gives the event-based detector a causal, uncertainty-aware prior abou
 
 The key change from a traditional filtering or tracking approach is that the persistent state is represented as **event-conditioned spatial memory**, not only as a list of tracked bounding boxes.
 
-The memory stores maps or object-linked map components such as:
+The full research direction may store maps or object-linked map components such as:
 
 - pedestrian belief;
 - uncertainty;
@@ -72,7 +74,7 @@ The memory stores maps or object-linked map components such as:
 - event support;
 - optional local motion consistency.
 
-These maps are aligned with the event tensor and can be consumed directly by the detector.
+The current implementation stores full-frame belief, heuristic uncertainty, age, and event-support maps aligned with the detector tensor.
 
 The method can still use detections to initialize, reinforce, or suppress memory hypotheses, but its primary output is a set of **soft spatial priors**, not track IDs.
 
@@ -200,7 +202,7 @@ S_k(u,v) =
 \right)
 \]
 
-where \(N_k(u,v)\) is a local event count or event-energy measure.
+where \(N_k(u,v)\) is a local event count or event-energy measure. In the current detector-integrated implementation, the default support source is the normalized count channel of each temporal stage, not a sum over all heterogeneous event channels.
 
 The support map does not directly decide detection. It modulates memory reliability and uncertainty.
 
@@ -246,7 +248,7 @@ t_{k-1}^{\mathrm{window\ end}}
 
 Do not use inference completion time or CPU callback intervals as the memory timestep.
 
-The first version can use simple decay and uncertainty growth. Later versions may add event-flow-based memory warping or learned propagation.
+The first version uses simple in-place decay and uncertainty growth. It does not move memory according to pedestrian motion. Later versions may add event-flow-based memory warping, learned propagation, or object-level velocity estimates.
 
 ---
 

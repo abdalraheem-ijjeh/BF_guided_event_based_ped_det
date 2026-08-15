@@ -89,6 +89,11 @@ def main() -> int:
     memory_cfg = EventMemoryConfig(
         height=int(detector_cfg.image_size),
         width=int(detector_cfg.image_size),
+        num_time_bins=int(detector_cfg.num_time_bins),
+        use_recency_channel=bool(detector_cfg.use_recency_channel),
+        use_count_channel=bool(detector_cfg.use_count_channel),
+        support_source=str(cfg.get("memory", {}).get("support_source", "count_channel")),
+        prior_mode=str(cfg.get("memory", {}).get("prior_mode", "full")),
     )
     model_cfg = dict(cfg)
     model_cfg["model"] = dict(cfg["model"])
@@ -134,8 +139,8 @@ def main() -> int:
             memory.reset(batch_size=1)
 
         stage_tensors = [stage.to(device) for stage in stage_tensors]
-        priors = memory.make_priors(
-            stage_tensors[-1],
+        priors = memory.make_stage_priors(
+            stage_tensors,
             window_end_time=float(meta["window_end_time"]),
         )
         stage_tensors_with_priors = append_priors_to_stage_tensors(
@@ -178,7 +183,7 @@ def main() -> int:
             "[INFO] step "
             f"{completed}/{args.steps} seq={meta['sequence_id']} pos={meta['sequence_position']} "
             f"start={meta['is_sequence_start']} loss={float(loss_out.loss.item()):.4f} "
-            f"prior_shape={tuple(priors.shape)} stage_shape={tuple(stage_tensors_with_priors[-1].shape)}"
+            f"prior_shape={tuple(priors[-1].shape)} stage_shape={tuple(stage_tensors_with_priors[-1].shape)}"
         )
         if completed >= int(args.steps):
             break

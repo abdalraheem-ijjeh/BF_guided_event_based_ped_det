@@ -67,9 +67,14 @@ train:
 memory:
   enabled: true
   prior_channels: 4
+  prior_mode: full
   teacher_forcing_epochs: 5
   scheduled_sampling_epochs: 15
+  teacher_box_jitter_std_frac: 0.01
+  teacher_box_drop_prob: 0.03
+  teacher_false_box_prob: 0.01
   prediction_update_score_threshold: 0.25
+  prediction_support_gate_strength: 0.25
   dropout_prob: 0.05
   belief_decay_per_second: 0.25
   uncertainty_growth_per_second: 0.35
@@ -77,6 +82,7 @@ memory:
   belief_mix: 0.80
   detection_uncertainty_reduction: 0.85
   silence_uncertainty_growth: 0.20
+  support_source: count_channel
   event_count_reference: 4.0
   support_pool_kernel: 5
   stale_age_threshold: 0.85
@@ -139,6 +145,7 @@ inference:
   threshold: 0.25
   nms_iou: 0.5
   topk: 50
+  pre_nms_topk: 1000
   target_live_stride_ms: 50
   active_crop:
     enabled: false
@@ -151,8 +158,10 @@ eval:
   threshold: 0.05
   nms_iou: 0.5
   topk: 100
+  pre_nms_topk: 1000
+  decode_on_cpu: true
   batch_size: 1
-  num_workers: 4
+  num_workers: 0
   max_samples: 0
   no_person_thresholds: [0.2, 0.3, 0.4, 0.5]
   f1_thresholds: [0.2, 0.3, 0.4, 0.5]

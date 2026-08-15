@@ -35,10 +35,12 @@ old input channels = 11
 new input channels = 11 + 4 = 15
 ```
 
-Append the same four memory-prior channels to every temporal stage:
+Append four memory-prior channels to every temporal stage. Belief,
+uncertainty, and age are shared causal memory fields; support is computed from
+each stage's own event representation:
 
 ```python
-priors = memory.make_priors(anchor_stage, window_end_time=t_end)
+priors = memory.make_stage_priors(stage_tensors, window_end_time=t_end)
 stage_tensors = append_priors_to_stage_tensors(stage_tensors, priors, image_size=224)
 ```
 

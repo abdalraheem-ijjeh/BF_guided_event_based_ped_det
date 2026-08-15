@@ -40,11 +40,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, default=Path("manifests/pedro_original_manifest.csv"))
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--init-checkpoint", type=Path, default=None)
+    parser.add_argument("--resume-checkpoint", type=Path, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--max-train-steps", type=int, default=0)
     parser.add_argument("--max-valid-steps", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=None)
+    parser.add_argument(
+        "--prior-mode",
+        choices=("full", "support_only", "memory_only", "belief_only", "zero"),
+        default=None,
+    )
+    parser.add_argument(
+        "--support-source",
+        choices=("count_channel", "voxel_channels", "all_channels"),
+        default=None,
+    )
     return parser.parse_args()
 
 
@@ -96,6 +107,11 @@ def build_memory_config(cfg: dict, image_size: int) -> EventMemoryConfig:
         silence_uncertainty_growth=float(memory_cfg.get("silence_uncertainty_growth", 0.20)),
         event_count_reference=float(memory_cfg.get("event_count_reference", 4.0)),
         support_pool_kernel=int(memory_cfg.get("support_pool_kernel", 5)),
+        num_time_bins=int(cfg["dataset"].get("num_time_bins", 4)),
+        use_recency_channel=bool(cfg["dataset"].get("use_recency_channel", True)),
+        use_count_channel=bool(cfg["dataset"].get("use_count_channel", True)),
+        support_source=str(memory_cfg.get("support_source", "count_channel")),
+        prior_mode=str(memory_cfg.get("prior_mode", "full")),
         stale_age_threshold=float(memory_cfg.get("stale_age_threshold", 0.85)),
         stale_uncertainty_threshold=float(memory_cfg.get("stale_uncertainty_threshold", 0.85)),
         stale_suppression=float(memory_cfg.get("stale_suppression", 0.15)),
@@ -117,6 +133,12 @@ def validate_config(cfg: dict) -> None:
         raise ValueError("dataset.anchor_dt_ms must match the last detector stage used for support priors")
     if int(cfg.get("memory", {}).get("prior_channels", 4)) != 4:
         raise ValueError("memory.prior_channels must be 4: belief, uncertainty, age, support")
+    support_source = str(cfg.get("memory", {}).get("support_source", "count_channel"))
+    if support_source not in {"count_channel", "voxel_channels", "all_channels"}:
+        raise ValueError("memory.support_source must be count_channel, voxel_channels, or all_channels")
+    prior_mode = str(cfg.get("memory", {}).get("prior_mode", "full"))
+    if prior_mode not in {"full", "support_only", "memory_only", "belief_only", "zero"}:
+        raise ValueError("memory.prior_mode must be full, support_only, memory_only, belief_only, or zero")
 
 
 def build_loader(
@@ -135,6 +157,7 @@ def build_loader(
         include_empty=True,
     )
     is_train = split == "train"
+    loader_cfg = cfg["train"] if is_train else cfg.get("eval", {})
     sampler = SequentialEventNativeBatchSampler(
         dataset,
         batch_size=1,
@@ -145,10 +168,35 @@ def build_loader(
         dataset,
         batch_sampler=sampler,
         collate_fn=collate_event_native_memory,
-        num_workers=int(cfg["train"].get("num_workers", 0)),
-        pin_memory=bool(cfg["train"].get("pin_memory", False)),
+        num_workers=int(loader_cfg.get("num_workers", cfg["train"].get("num_workers", 0))),
+        pin_memory=bool(loader_cfg.get("pin_memory", cfg["train"].get("pin_memory", False))),
     )
     return dataset, loader
+
+
+def validate_dataset_paths(
+    dataset: ManifestEventNativeSequenceDataset,
+    *,
+    split_name: str,
+    max_report: int = 10,
+) -> None:
+    missing = []
+    for _, row in dataset.rows.iterrows():
+        npy_path = Path(row["npy_path"])
+        xml_path = Path(row["xml_path"])
+        if not npy_path.exists():
+            missing.append(("npy", str(npy_path)))
+        if str(xml_path) and not xml_path.exists():
+            missing.append(("xml", str(xml_path)))
+        if len(missing) >= int(max_report):
+            break
+    if missing:
+        examples = ", ".join(f"{kind}:{path}" for kind, path in missing)
+        raise FileNotFoundError(
+            f"{split_name} manifest contains missing dataset files. "
+            f"First missing paths: {examples}. Check that /media/birb/grvc is mounted "
+            "and regenerate the manifest if the dataset root changed."
+        )
 
 
 def teacher_forcing_probability(epoch: int, cfg: dict) -> float:
@@ -175,6 +223,69 @@ def boxes_from_targets(targets: list[dict[str, torch.Tensor | str]], device: tor
             output[batch_idx, :count, :4] = boxes
             output[batch_idx, :count, 4] = 1.0
     return output
+
+
+def corrupt_teacher_boxes(boxes: torch.Tensor, cfg: dict, *, image_size: int) -> torch.Tensor:
+    memory_cfg = cfg.get("memory", {})
+    drop_prob = float(memory_cfg.get("teacher_box_drop_prob", 0.0))
+    jitter_std_frac = float(memory_cfg.get("teacher_box_jitter_std_frac", 0.0))
+    false_prob = float(memory_cfg.get("teacher_false_box_prob", 0.0))
+    if drop_prob <= 0.0 and jitter_std_frac <= 0.0 and false_prob <= 0.0:
+        return boxes
+
+    corrupted = boxes.clone()
+    valid = corrupted[..., 4] > 0.0
+
+    if jitter_std_frac > 0.0 and bool(valid.any()):
+        noise = torch.randn_like(corrupted[..., :4]) * float(image_size) * jitter_std_frac
+        corrupted[..., :4] = corrupted[..., :4] + noise * valid[..., None].to(corrupted.dtype)
+        x1 = torch.minimum(corrupted[..., 0], corrupted[..., 2]).clamp(0.0, float(image_size))
+        y1 = torch.minimum(corrupted[..., 1], corrupted[..., 3]).clamp(0.0, float(image_size))
+        x2 = torch.maximum(corrupted[..., 0], corrupted[..., 2]).clamp(0.0, float(image_size))
+        y2 = torch.maximum(corrupted[..., 1], corrupted[..., 3]).clamp(0.0, float(image_size))
+        still_valid = valid & ((x2 - x1) >= 2.0) & ((y2 - y1) >= 2.0)
+        corrupted[..., 0] = x1
+        corrupted[..., 1] = y1
+        corrupted[..., 2] = x2
+        corrupted[..., 3] = y2
+        corrupted[..., 4] = corrupted[..., 4] * still_valid.to(corrupted.dtype)
+
+    if drop_prob > 0.0 and bool(valid.any()):
+        keep = torch.rand_like(corrupted[..., 4]) >= drop_prob
+        corrupted[..., 4] = corrupted[..., 4] * keep.to(corrupted.dtype)
+
+    if false_prob > 0.0:
+        false_boxes = []
+        for batch_idx in range(corrupted.shape[0]):
+            if random.random() >= false_prob:
+                false_boxes.append(torch.zeros((0, 5), device=corrupted.device, dtype=corrupted.dtype))
+                continue
+            min_size = float(image_size) * 0.04
+            max_size = float(image_size) * 0.20
+            width = random.uniform(min_size, max_size)
+            height = random.uniform(min_size, max_size)
+            x1 = random.uniform(0.0, max(0.0, float(image_size) - width))
+            y1 = random.uniform(0.0, max(0.0, float(image_size) - height))
+            false_boxes.append(
+                torch.tensor(
+                    [[x1, y1, x1 + width, y1 + height, 0.5]],
+                    device=corrupted.device,
+                    dtype=corrupted.dtype,
+                )
+            )
+        max_false = max((item.shape[0] for item in false_boxes), default=0)
+        if max_false > 0:
+            padded_false = torch.zeros(
+                (corrupted.shape[0], max_false, 5),
+                device=corrupted.device,
+                dtype=corrupted.dtype,
+            )
+            for batch_idx, item in enumerate(false_boxes):
+                if item.numel():
+                    padded_false[batch_idx, : item.shape[0]] = item
+            corrupted = torch.cat([corrupted, padded_false], dim=1)
+
+    return corrupted
 
 
 def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
@@ -212,23 +323,38 @@ def decode_memory_boxes(
     threshold: float,
     nms_iou: float,
     topk: int,
+    pre_nms_topk: int = 0,
+    decode_on_cpu: bool = False,
 ) -> torch.Tensor:
     batch_size = int(outputs.detections.logits[0].shape[0])
+    output_device = outputs.detections.logits[0].device
+    work_device = torch.device("cpu") if decode_on_cpu else output_device
     decoded = []
     for batch_idx in range(batch_size):
         boxes_all = []
         scores_all = []
         for level_idx, (logits, box_map) in enumerate(zip(outputs.detections.logits, outputs.detections.boxes)):
-            logits_i = logits[batch_idx]
-            box_i = box_map[batch_idx]
+            logits_i = logits[batch_idx].detach().to(work_device) if decode_on_cpu else logits[batch_idx]
+            box_i = box_map[batch_idx].detach().to(work_device) if decode_on_cpu else box_map[batch_idx]
             _, level_h, level_w = logits_i.shape
             ys = (torch.arange(level_h, device=logits_i.device, dtype=torch.float32) + 0.5) / float(level_h)
             xs = (torch.arange(level_w, device=logits_i.device, dtype=torch.float32) + 0.5) / float(level_w)
             grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-            scores = torch.sigmoid(logits_i).reshape(-1)
+            scores = torch.nan_to_num(torch.sigmoid(logits_i).reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
             if outputs.detections.centerness is not None:
-                scores = scores * torch.sigmoid(outputs.detections.centerness[level_idx][batch_idx]).reshape(-1)
-            keep = scores >= float(threshold)
+                center_i = (
+                    outputs.detections.centerness[level_idx][batch_idx].detach().to(work_device)
+                    if decode_on_cpu
+                    else outputs.detections.centerness[level_idx][batch_idx]
+                )
+                center_scores = torch.nan_to_num(
+                    torch.sigmoid(center_i).reshape(-1),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                scores = scores * center_scores
+            keep = torch.isfinite(scores) & (scores >= float(threshold))
             if not bool(keep.any()):
                 continue
             box_ltrb = box_i.permute(1, 2, 0).reshape(-1, 4)[keep]
@@ -239,23 +365,31 @@ def decode_memory_boxes(
             x2 = (centers[:, 2] + box_ltrb[:, 2]).clamp(0.0, 1.0) * float(image_size)
             y2 = (centers[:, 3] + box_ltrb[:, 3]).clamp(0.0, 1.0) * float(image_size)
             boxes = torch.stack([x1, y1, x2, y2], dim=1)
-            valid = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+            valid = (
+                torch.isfinite(boxes).all(dim=1)
+                & torch.isfinite(scores)
+                & (boxes[:, 2] > boxes[:, 0])
+                & (boxes[:, 3] > boxes[:, 1])
+            )
             if bool(valid.any()):
                 boxes_all.append(boxes[valid])
                 scores_all.append(scores[valid])
         if not boxes_all:
-            decoded.append(torch.zeros((0, 5), dtype=torch.float32, device=outputs.detections.logits[0].device))
+            decoded.append(torch.zeros((0, 5), dtype=torch.float32, device=work_device))
             continue
         boxes = torch.cat(boxes_all, dim=0)
         scores = torch.cat(scores_all, dim=0)
+        if int(pre_nms_topk) > 0 and scores.numel() > int(pre_nms_topk):
+            scores, pre_keep = torch.topk(scores, k=int(pre_nms_topk), largest=True, sorted=True)
+            boxes = boxes[pre_keep]
         keep = nms_xyxy(boxes, scores, iou_threshold=float(nms_iou))
         if topk > 0:
             keep = keep[: int(topk)]
         decoded.append(torch.cat([boxes[keep], scores[keep, None]], dim=1))
     max_boxes = max((item.shape[0] for item in decoded), default=0)
     if max_boxes == 0:
-        return torch.zeros((batch_size, 0, 5), dtype=torch.float32, device=outputs.detections.logits[0].device)
-    padded = torch.zeros((batch_size, max_boxes, 5), dtype=torch.float32, device=outputs.detections.logits[0].device)
+        return torch.zeros((batch_size, 0, 5), dtype=torch.float32, device=work_device)
+    padded = torch.zeros((batch_size, max_boxes, 5), dtype=torch.float32, device=work_device)
     for batch_idx, item in enumerate(decoded):
         if item.numel():
             padded[batch_idx, : item.shape[0]] = item
@@ -426,7 +560,9 @@ def select_memory_update_boxes(
     is_train: bool,
 ) -> tuple[torch.Tensor, str]:
     if is_train and random.random() < teacher_forcing_probability(epoch, cfg):
-        return boxes_from_targets(targets, device=device), "teacher"
+        boxes = boxes_from_targets(targets, device=device)
+        boxes = corrupt_teacher_boxes(boxes, cfg, image_size=image_size)
+        return boxes, "teacher"
 
     inference_cfg = cfg.get("inference", {})
     memory_cfg = cfg.get("memory", {})
@@ -437,6 +573,7 @@ def select_memory_update_boxes(
         threshold=threshold,
         nms_iou=float(inference_cfg.get("nms_iou", 0.5)),
         topk=int(inference_cfg.get("topk", 50)),
+        pre_nms_topk=int(inference_cfg.get("pre_nms_topk", 1000)),
     )
     return boxes.detach(), "prediction"
 
@@ -448,6 +585,20 @@ def maybe_dropout_priors(priors: torch.Tensor, cfg: dict, *, is_train: bool) -> 
     if dropout_prob > 0.0 and random.random() < dropout_prob:
         return torch.zeros_like(priors)
     return priors
+
+
+def maybe_dropout_prior_sequence(
+    priors: Sequence[torch.Tensor],
+    cfg: dict,
+    *,
+    is_train: bool,
+) -> list[torch.Tensor]:
+    if not is_train:
+        return list(priors)
+    dropout_prob = float(cfg.get("memory", {}).get("dropout_prob", 0.0))
+    if dropout_prob > 0.0 and random.random() < dropout_prob:
+        return [torch.zeros_like(prior) for prior in priors]
+    return list(priors)
 
 
 def compute_loss(outputs, targets, image_size: int, loss_cfg: dict):
@@ -511,6 +662,8 @@ def run_epoch(
     ap_no_person_frames = 0
     eval_cfg = cfg.get("eval", {})
     inference_cfg = cfg.get("inference", {})
+    if max_steps <= 0 and (not is_train):
+        max_steps = int(eval_cfg.get("max_samples", 0))
 
     for stage_tensors, targets, metas in loader:
         meta = metas[0]
@@ -518,8 +671,8 @@ def run_epoch(
             memory.reset(batch_size=1)
 
         stage_tensors = [stage.to(device, non_blocking=True) for stage in stage_tensors]
-        priors = memory.make_priors(stage_tensors[-1], window_end_time=float(meta["window_end_time"]))
-        priors = maybe_dropout_priors(priors, cfg, is_train=is_train)
+        priors = memory.make_stage_priors(stage_tensors, window_end_time=float(meta["window_end_time"]))
+        priors = maybe_dropout_prior_sequence(priors, cfg, is_train=is_train)
         stage_tensors = append_priors_to_stage_tensors(stage_tensors, priors, image_size=image_size)
 
         if is_train:
@@ -548,6 +701,8 @@ def run_epoch(
                     threshold=float(eval_cfg.get("threshold", cfg.get("inference", {}).get("threshold", 0.05))),
                     nms_iou=float(eval_cfg.get("nms_iou", cfg.get("inference", {}).get("nms_iou", 0.5))),
                     topk=int(eval_cfg.get("topk", cfg.get("inference", {}).get("topk", 100))),
+                    pre_nms_topk=int(eval_cfg.get("pre_nms_topk", 1000)),
+                    decode_on_cpu=bool(eval_cfg.get("decode_on_cpu", True)),
                 )
                 decoded_items = valid_decoded_boxes(decoded_for_ap)
                 target_items = target_boxes_for_ap(targets, device=device)
@@ -572,6 +727,7 @@ def run_epoch(
                     threshold=memory_threshold,
                     nms_iou=float(inference_cfg.get("nms_iou", 0.5)),
                     topk=int(inference_cfg.get("topk", 50)),
+                    pre_nms_topk=int(inference_cfg.get("pre_nms_topk", 1000)),
                 )
                 update_mode = "prediction"
             else:
@@ -584,7 +740,12 @@ def run_epoch(
                     cfg=cfg,
                     is_train=is_train,
                 )
-            memory.update_with_detections(update_boxes)
+            support_gate_strength = (
+                float(cfg.get("memory", {}).get("prediction_support_gate_strength", 0.0))
+                if update_mode == "prediction"
+                else 0.0
+            )
+            memory.update_with_detections(update_boxes, support_gate_strength=support_gate_strength)
         teacher_updates += int(update_mode == "teacher")
         prediction_updates += int(update_mode == "prediction")
 
@@ -637,6 +798,109 @@ def build_scheduler(cfg: dict, optimizer: torch.optim.Optimizer, train_steps_per
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
+def load_training_checkpoint(
+    checkpoint_path: Path,
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    device: torch.device,
+    train_steps_per_epoch: int,
+    current_cfg: dict,
+) -> int:
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if not isinstance(checkpoint, dict) or "model" not in checkpoint:
+        raise ValueError(f"{checkpoint_path} is not a training checkpoint with model/optimizer state")
+    validate_resume_config_compatibility(checkpoint_path, checkpoint.get("config"), current_cfg)
+    model.load_state_dict(checkpoint["model"], strict=True)
+    if "optimizer" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    start_epoch = int(checkpoint.get("epoch", -1)) + 1
+    if scheduler is not None:
+        if checkpoint.get("scheduler") is not None:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+        elif start_epoch > 0:
+            global_step = start_epoch * max(1, int(train_steps_per_epoch))
+            scheduler.last_epoch = global_step
+            for group, base_lr, lr_lambda in zip(
+                optimizer.param_groups,
+                scheduler.base_lrs,
+                scheduler.lr_lambdas,
+            ):
+                group["lr"] = float(base_lr) * float(lr_lambda(global_step))
+            scheduler._last_lr = [group["lr"] for group in optimizer.param_groups]
+    return start_epoch
+
+
+def nested_get(mapping: dict, path: Sequence[str], default=None):
+    current = mapping
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
+
+
+def validate_resume_config_compatibility(
+    checkpoint_path: Path,
+    checkpoint_cfg: dict | None,
+    current_cfg: dict,
+) -> None:
+    if checkpoint_cfg is None:
+        raise ValueError(
+            f"{checkpoint_path} does not contain config metadata; start a new run with --init-checkpoint"
+        )
+
+    critical_paths = [
+        ("model", "in_channels"),
+        ("dataset", "dts_ms"),
+        ("dataset", "num_time_bins"),
+        ("dataset", "use_recency_channel"),
+        ("dataset", "use_count_channel"),
+        ("memory", "prior_mode"),
+        ("memory", "support_source"),
+        ("memory", "prediction_support_gate_strength"),
+        ("memory", "teacher_box_jitter_std_frac"),
+        ("memory", "teacher_box_drop_prob"),
+        ("memory", "teacher_false_box_prob"),
+    ]
+    mismatches = []
+    for path in critical_paths:
+        old_value = nested_get(checkpoint_cfg, path, default=None)
+        new_value = nested_get(current_cfg, path, default=None)
+        if old_value != new_value:
+            mismatches.append((".".join(path), old_value, new_value))
+
+    if mismatches:
+        details = ", ".join(
+            f"{key}: checkpoint={old!r} current={new!r}"
+            for key, old, new in mismatches
+        )
+        raise ValueError(
+            f"{checkpoint_path} was trained with an incompatible memory strategy ({details}). "
+            "Start a clean run from the event-only --init-checkpoint instead."
+        )
+
+
+def read_best_metrics_from_log(log_path: Path) -> tuple[float, float]:
+    best_loss = float("inf")
+    best_ap = -float("inf")
+    if not log_path.exists():
+        return best_loss, best_ap
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        valid = record.get("valid", {})
+        best_loss = min(best_loss, float(valid.get("loss", float("inf"))))
+        if "AP" in valid:
+            best_ap = max(best_ap, float(valid["AP"]))
+    return best_loss, best_ap
+
+
 def main() -> int:
     args = parse_args()
     cfg = load_config(args.config)
@@ -646,6 +910,10 @@ def main() -> int:
         cfg["train"]["epochs"] = int(args.epochs)
     if args.log_every is not None:
         cfg["train"]["log_every"] = int(args.log_every)
+    if args.prior_mode is not None:
+        cfg.setdefault("memory", {})["prior_mode"] = args.prior_mode
+    if args.support_source is not None:
+        cfg.setdefault("memory", {})["support_source"] = args.support_source
 
     set_seed(int(cfg["experiment"]["seed"]))
     validate_config(cfg)
@@ -658,6 +926,8 @@ def main() -> int:
 
     train_ds, train_loader = build_loader(cfg, args.manifest, split="train")
     valid_ds, valid_loader = build_loader(cfg, args.manifest, split="valid")
+    validate_dataset_paths(train_ds, split_name="train")
+    validate_dataset_paths(valid_ds, split_name="valid")
     print(
         "[INFO] datasets "
         f"train_rows={len(train_ds)} train_sequences={len(train_ds.sequence_ids)} "
@@ -668,7 +938,7 @@ def main() -> int:
     if bool(cfg["train"].get("freeze_batchnorm", False)):
         print(f"[INFO] freeze_batchnorm_stats=true layers={freeze_batchnorm_stats(model)}")
     init_checkpoint = args.init_checkpoint or cfg["train"].get("init_checkpoint")
-    if init_checkpoint:
+    if init_checkpoint and args.resume_checkpoint is None:
         report = load_checkpoint_with_expanded_input(model, init_checkpoint, device=device)
         print(f"[INFO] init_checkpoint={init_checkpoint} report={report}")
 
@@ -680,11 +950,22 @@ def main() -> int:
     epochs = int(cfg["train"]["epochs"])
     train_steps = args.max_train_steps if args.max_train_steps > 0 else len(train_loader)
     scheduler = build_scheduler(cfg, optimizer, train_steps_per_epoch=train_steps, epochs=epochs)
+    start_epoch = 0
+    if args.resume_checkpoint is not None:
+        start_epoch = load_training_checkpoint(
+            args.resume_checkpoint,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            train_steps_per_epoch=train_steps,
+            current_cfg=cfg,
+        )
+        print(f"[INFO] resume_checkpoint={args.resume_checkpoint} start_epoch={start_epoch}")
 
     log_path = output_dir / "log.jsonl"
-    best_valid_loss = float("inf")
-    best_valid_ap = -float("inf")
-    for epoch in range(epochs):
+    best_valid_loss, best_valid_ap = read_best_metrics_from_log(log_path)
+    for epoch in range(start_epoch, epochs):
         train_metrics = run_epoch(
             model=model,
             loader=train_loader,
@@ -737,6 +1018,7 @@ def main() -> int:
             "epoch": epoch,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
             "config": cfg,
         }
         torch.save(checkpoint, output_dir / "checkpoint_last.pth")
@@ -745,7 +1027,8 @@ def main() -> int:
             best_valid_loss = valid_loss
             torch.save(checkpoint, output_dir / "checkpoint_best_loss.pth")
         valid_ap = float(valid_metrics.get("AP", -float("inf")))
-        if int(args.max_valid_steps) <= 0 and valid_ap > best_valid_ap:
+        full_valid_eval = int(args.max_valid_steps) <= 0 and int(cfg.get("eval", {}).get("max_samples", 0)) <= 0
+        if full_valid_eval and valid_ap > best_valid_ap:
             best_valid_ap = valid_ap
             torch.save(checkpoint, output_dir / "checkpoint_best_ap.pth")
 

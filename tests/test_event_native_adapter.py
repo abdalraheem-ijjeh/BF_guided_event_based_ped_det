@@ -44,7 +44,17 @@ def test_event_native_adapter_shapes_and_sequence_batching(tmp_path: Path) -> No
         collate_fn=collate_event_native_memory,
     )
     batch_stages, targets, metas = next(iter(loader))
-    memory = UncertaintyAwareEventMemory(EventMemoryConfig(height=32, width=32), batch_size=1)
+    memory = UncertaintyAwareEventMemory(
+        EventMemoryConfig(
+            height=32,
+            width=32,
+            num_time_bins=2,
+            use_recency_channel=True,
+            use_count_channel=True,
+            support_source="count_channel",
+        ),
+        batch_size=1,
+    )
     priors = memory.make_priors(batch_stages[-1], window_end_time=metas[0]["window_end_time"])
     augmented = append_priors_to_stage_tensors(batch_stages, priors, image_size=32)
 
